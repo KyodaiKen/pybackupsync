@@ -61,6 +61,35 @@ def format_time(seconds):
         return f"{d:02d}:{h:02d}:{m:02d}"
     return f"00:{h:02d}:{m:02d}"
 
+def format_time_detailed(total_seconds_float):
+    """
+    Formats total seconds (float) into DDd HHh MMm SSs MSms format.
+    """
+    if total_seconds_float is None or total_seconds_float < 0:
+        return "N/A"
+        
+    total_milliseconds = int(round(total_seconds_float * 1000))
+
+    ms = total_milliseconds % 1000
+    total_seconds = total_milliseconds // 1000
+
+    s = total_seconds % 60
+    total_minutes = total_seconds // 60
+
+    m = total_minutes % 60
+    total_hours = total_minutes // 60
+
+    h = total_hours % 24
+    d = total_hours // 24
+
+    return (
+        f"{d:02d}d "
+        f"{h:02d}h "
+        f"{m:02d}m "
+        f"{s:02d}s "
+        f"{ms:03d}ms"
+    )
+
 def shorten_path(path_str, max_len):
     if len(path_str) <= max_len:
         return path_str
@@ -111,7 +140,7 @@ def mount_drive(uuid, mount_point):
     
     # 1. Check if physically present
     if not os.path.exists(dev_path):
-        print(f"\n>> Please connect drive {uuid}...")
+        print(f"\n>> Please connect drive {mount_point}...")
         while not os.path.exists(dev_path):
             if SHUTDOWN_EVENT.is_set(): return None
             time.sleep(1)
@@ -291,7 +320,8 @@ class Job:
         
         # Resume detection
         self.resume_mode = False
-        """ if os.path.exists(dst):
+        """ NOT IMPLEMENTED
+            if os.path.exists(dst):
             dst_sz = os.path.getsize(dst)
             if dst_sz < size:
                 self.resume_mode = True
@@ -308,12 +338,13 @@ def worker_func(job, queue):
     "-L 1048576" is for testing the progress bar to slow it down to 1048576 byte per second. (WOW)
     Add -s if resuming.
     """
-    cmd = ["pv", "-L 1048576", "-i", "0.5", "-F", "%t %b %r %a", "-n", job.src, "-o", job.dst]
+    cmd = ["pv", "-i", "0.5", "-F", "%t %b %r %a", "-n", job.src, "-o", job.dst]
     
-    if job.resume_mode:
-        # Logic requested -s for resume functionality
-        # Note: pv's -s means size already transferred.
-        cmd.insert(1, "-s " + str(job.bytes_done))
+    #if job.resume_mode:
+        # NOT IMPLEMENTED YET
+
+    # For testing
+    cmd.insert(1, "-L 1048576")
 
     try:
         # PV with -n writes numeric data to Stderr
@@ -496,6 +527,8 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
 # --- Main Logic ---
 
 def main():
+    start_time = time.time()
+
     signal.signal(signal.SIGINT, lambda s, f: SHUTDOWN_EVENT.set())
     
     parser = argparse.ArgumentParser()
@@ -512,7 +545,7 @@ def main():
     with open(cfg_path) as f:
         config = yaml.safe_load(f)
 
-    # 1. Mount Source & Define Source Root
+    # Mount Source & Define Source Root
     src_cfg = config['source']
     src_mp = mount_drive(src_cfg['uuid'], src_cfg['mount_point'])
     if not src_mp: return
@@ -520,10 +553,9 @@ def main():
     # Combine Mount Point + Relative Path
     src_root = safe_join(src_mp, src_cfg.get('relative_path', ''))
     
-    # 2. Scan Files
     files_to_copy, total_src_bytes = [], 0
 
-    # 3. Mount Destinations & Check Space
+    # Mount Destinations & Check Space
     dest_cfgs = config['destinations']
     jobs = []
     
@@ -539,6 +571,7 @@ def main():
         # Define specific destination root
         dest_root = safe_join(d_mp, d_cfg.get('relative_path', ''))
 
+        # Determine files to be copied
         files_to_copy, total_src_bytes = scan_source(src_root, dest_root, src_cfg.get('exclude_patterns', []))
         if not files_to_copy:
             print("No files found to copy.")
@@ -563,15 +596,18 @@ def main():
 
     total_job_bytes = sum(j.size for j in jobs)
 
-    # 4. Run Copy
+    # Run Copy
     print(f"Starting Copy. Total data: {format_bytes(total_job_bytes)}")
     time.sleep(1)
     
     display_loop(jobs, config.get('max_parallel_processes', 1), total_job_bytes)
     
-    print("\nCopy operation finished.")
+    end_time = time.time()
+    end_time_str = format_time_detailed(end_time - start_time)
+
+    print(f"\nCopy operation finished after {end_time_str}.")
     
-    # 5. Cleanup
+    # Cleanup
     if args.umount:
         unmount_all()
     elif AUTO_MOUNTED_PATHS:
