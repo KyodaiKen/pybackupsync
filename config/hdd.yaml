@@ -1,0 +1,23 @@
+max_parallel_processes: 2
+
+source:
+  uuid: "FED7-AF89"
+  mount_point: "/mnt/tmp"
+  path: "backups"
+  exclude_patterns: []
+
+destinations:
+  - uuid: "E6FF-034F"
+    mount_point: "/mnt/hdda"
+    path: "backups"
+    priority: 1
+    deletion_policy: "oldest"
+    deletion_exclude_patterns:
+      - "*-img"
+  - uuid: "E84C-4689"
+    mount_point: "/mnt/hddb"
+    path: "backups"
+    priority: 2
+    deletion_policy: "month_dupes"
+    deletion_exclude_patterns:
+      - "*-img"
