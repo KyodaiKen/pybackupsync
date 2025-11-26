@@ -344,7 +344,7 @@ def worker_func(job, queue):
         # NOT IMPLEMENTED YET
 
     # For testing
-    cmd.insert(1, "-L 1048576")
+    # cmd.insert(1, "-L 1048576")
 
     try:
         # PV with -n writes numeric data to Stderr
@@ -551,7 +551,7 @@ def main():
     if not src_mp: return
 
     # Combine Mount Point + Relative Path
-    src_root = safe_join(src_mp, src_cfg.get('relative_path', ''))
+    src_root = safe_join(src_mp, src_cfg.get('path', ''))
     
     files_to_copy, total_src_bytes = [], 0
 
@@ -569,7 +569,7 @@ def main():
             continue
             
         # Define specific destination root
-        dest_root = safe_join(d_mp, d_cfg.get('relative_path', ''))
+        dest_root = safe_join(d_mp, d_cfg.get('path', ''))
 
         # Determine files to be copied
         files_to_copy, total_src_bytes = scan_source(src_root, dest_root, src_cfg.get('exclude_patterns', []))
