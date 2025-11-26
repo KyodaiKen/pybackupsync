@@ -356,7 +356,7 @@ def worker_func(job, queue):
     "-L 1048576" is for testing the progress bar to slow it down to 1048576 byte per second. (WOW)
     Add -s if resuming.
     """
-    cmd = ["pv", "-i", "0.5", "-F", "%t %b %r %a", "-n", job.src, "-o", job.dst]
+    cmd = ["pv", "-i", "0", "-F", "%t %b %r %a", "-n", job.src, "-o", job.dst]
     
     #if job.resume_mode:
         # NOT IMPLEMENTED YET
