@@ -12,11 +12,13 @@ import fnmatch
 from pathlib import Path
 from datetime import datetime
 from queue import Queue, Empty, PriorityQueue
+import itertools
 
 # --- Global State ---
 SHUTDOWN_EVENT = threading.Event()
 AUTO_MOUNTED_PATHS = [] # Tracks mount points we created
 TERMINAL_WIDTH = 80
+job_counter = itertools.count()
 
 # --- Formatting Utilities ---
 
@@ -194,7 +196,7 @@ def scan_source(root_path, dest_root, exclude_patterns):
     Returns list of (absolute_path, relative_to_root, size) for files that don't exist in dest_root.
     """
     files_found = []
-    total_bytes = 0
+    total_bytes_needed = 0
     
     if not os.path.exists(root_path):
         print(f"Error: Source path does not exist: {root_path}")
@@ -212,19 +214,22 @@ def scan_source(root_path, dest_root, exclude_patterns):
 
             abs_path = os.path.join(root, f)
             try:
-                size = os.path.getsize(abs_path)
+                new_size = os.path.getsize(abs_path)
                 rel_path = os.path.relpath(abs_path, root_path)
                 dest_file = os.path.join(dest_root, rel_path)
+                existing_size = 0 # Assume 0 if file doesn't exist
                 if os.path.exists(dest_file):
-                    dest_size = os.path.getsize(dest_file)
-                    if size == dest_size:
+                    existing_size = os.path.getsize(dest_file)
+                    if new_size == existing_size:
                         continue
-                files_found.append((abs_path, rel_path, size))
-                total_bytes += size
+                # Calculate the net difference
+                net_change = new_size - existing_size
+                files_found.append((abs_path, rel_path, new_size, existing_size))
+                total_bytes_needed += net_change
             except OSError:
                 pass
                 
-    return files_found, total_bytes
+    return files_found, total_bytes_needed
 
 def get_files_with_ctime(directory):
     """Return list of (path, ctime) for all files in directory recursively."""
@@ -251,7 +256,7 @@ def ensure_space(target_root, needed_bytes, policy):
     # Check partition usage
     total, used, free = shutil.disk_usage(target_root)
     
-    if free >= needed_bytes:
+    if needed_bytes <= 0 or free >= needed_bytes:
         return
 
     deficit = needed_bytes - free
@@ -291,6 +296,7 @@ def ensure_space(target_root, needed_bytes, policy):
         try:
             sz = os.path.getsize(fpath)
             os.remove(fpath)
+            print(f"Delted {fpath}")
             deleted_size += sz
             free += sz
             if free >= needed_bytes:
@@ -304,11 +310,13 @@ def ensure_space(target_root, needed_bytes, policy):
 # --- Copy Logic & Workers ---
 
 class Job:
-    def __init__(self, src, dst, size, priority):
+    def __init__(self, src, dst, size, priority, dest_uuid):
         self.src = src
         self.dst = dst
         self.size = size
         self.priority = priority
+        self.dest_uuid = dest_uuid  # Store the destination UUID
+        self.count = next(job_counter) # Unique counter for stable sort
         
         # Stats
         self.bytes_done = 0
@@ -328,13 +336,23 @@ class Job:
                 self.bytes_done = dst_sz """
 
     def __lt__(self, other):
-        # PriorityQueue uses < to sort. Lower number = Higher Priority
-        return self.priority < other.priority
+        # 1. Primary sort: Lower priority value comes first (higher priority)
+        if self.priority != other.priority:
+            return self.priority < other.priority
+        
+        # 2. Secondary sort (Interleaving): Use the UUID string for alternating
+        #    This ensures Dest A jobs come before Dest B jobs, creating a stable,
+        #    alternating order when priorities are equal.
+        if self.dest_uuid != other.dest_uuid:
+            return self.dest_uuid < other.dest_uuid
+            
+        # 3. Tertiary sort: If priority and UUID are equal, use insertion order.
+        return self.count < other.count
 
 def worker_func(job, queue):
     """
     Executes PV.
-    Command: pv -i 0.5 -F "%t %b %r %a" -n {$source} -o {$destination}
+    Command: pv -i 0.5 -F "%t %b %r %a" -n {$source} > {$destination}
     "-L 1048576" is for testing the progress bar to slow it down to 1048576 byte per second. (WOW)
     Add -s if resuming.
     """
@@ -388,6 +406,7 @@ def worker_func(job, queue):
             queue.put(('done', job))
         else:
             job.error = f"Exit Code {proc.returncode}"
+            #print(f"Error code: {proc.returncode}, command: {cmd}");
             queue.put(('error', job))
 
     except Exception as e:
@@ -403,14 +422,30 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
         pending.put(j)
         
     active = []
+    active_dest_uuids = set()
     
     def refill_workers():
+        # Holding area for jobs that couldn't launch because their drive was busy
+        deferred_jobs = [] 
+        
         while len(active) < max_parallel and not pending.empty():
-            nxt = pending.get()
-            active.append(nxt)
-            t = threading.Thread(target=worker_func, args=(nxt, q))
-            t.daemon = True
-            t.start()
+            job = pending.get()
+            
+            if job.dest_uuid not in active_dest_uuids:
+                # LAUNCH JOB: Destination is free
+                active.append(job)
+                active_dest_uuids.add(job.dest_uuid)
+                
+                t = threading.Thread(target=worker_func, args=(job, q))
+                t.daemon = True
+                t.start()
+            else:
+                # DEFER JOB: Destination is busy, put it aside temporarily
+                deferred_jobs.append(job)
+        
+        # Put any deferred jobs back into the main queue
+        for job in deferred_jobs:
+            pending.put(job) # Put deferred jobs back in the PriorityQueue
 
     refill_workers()
     
@@ -428,7 +463,11 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
                         if job_obj in active:
                             active.remove(job_obj)
                             completed_jobs.append(job_obj)
-                            refill_workers()
+                            
+                            if job_obj.dest_uuid in active_dest_uuids:
+                                active_dest_uuids.remove(job_obj.dest_uuid)
+
+                            refill_workers() # Attempt to launch the next available job
             except Empty:
                 pass
 
@@ -443,11 +482,12 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             sys.stdout.flush()
 
             output_lines = []
+            output_lines.append("+" + ("=" * (width - 2)) + "+")
 
             # --- Individual Jobs ---
             for j in active:
-                s_name = shorten_path(j.src, width - 10)
-                d_name = shorten_path(j.dst, width - 10)
+                s_name = shorten_path(j.src, width - 12)
+                d_name = shorten_path(j.dst, width - 12)
                 
                 pct = 0.0
                 if j.size > 0: pct = (j.bytes_done / j.size) * 100.0
@@ -455,13 +495,17 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
                 # Format: {$PercentDone} {$BytesTransferred} / {$file_size} @{TransferRate} ({$TransferRateAvg}) ETA: {$TimeRemaining}
                 stats = f"{pct:06.2f}% {format_bytes(j.bytes_done)} / {format_bytes(j.size)} @{format_rate(j.rate)} ({format_rate(j.avg_rate)}) ETA: {format_time(j.eta)} "
                 
-                bar_space = width - len(stats) - 8
+                bar_space = width - len(stats) - 12
                 bar = draw_progress_bar(pct, bar_space)
                 
-                output_lines.append(f"Source: {s_name}")
-                output_lines.append(f"Destin: {d_name}")
-                output_lines.append(f"Prgrss: {stats}{bar}")
-                #output_lines.append("\n")
+                # Calculate padding needed for the Source/Destination lines
+                s_pad = " " * (width - len(s_name) - 12)
+                d_pad = " " * (width - len(d_name) - 12)
+
+                output_lines.append(f"| Source: {s_name}{s_pad} |")
+                output_lines.append(f"| Destin: {d_name}{d_pad} |")
+                output_lines.append(f"| Prgrss: {stats}{bar} |")
+                output_lines.append("+" + ("-" * (width - 2)) + "+")
 
             # --- Total Progress ---
             # Sum bytes done from (completed + active)
@@ -486,28 +530,29 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
                 total_eta = remaining_total / total_avg_rate
 
             t_stats = f"{total_pct:06.2f}% {format_bytes(total_done)} / {format_bytes(total_scope_bytes)} @{format_rate(total_rate)} ({format_rate(total_avg_rate)}) ETA: {format_time(total_eta)} "
-            t_bar = draw_progress_bar(total_pct, width - len(t_stats) - 8)
+            t_bar = draw_progress_bar(total_pct, width - len(t_stats) - 12)
             
-            output_lines.append(f"TOTAL : {t_stats}{t_bar}")
+            output_lines.append(f"| TOTAL : {t_stats}{t_bar} |")
+            output_lines.append("+" + ("=" * (width - 2)) + "+")
 
             # Print the new content
             sys.stdout.write("\n".join(output_lines))
-
-            lines_printed_last_cycle = len(output_lines)-1
             
             # Clear extra lines if the number of active jobs decreased
             current_line_count = len(output_lines)
             if lines_printed_last_cycle > current_line_count:
                 extra_lines = lines_printed_last_cycle - current_line_count
-                
+               
                 # Move cursor up to the start of the extra space
                 sys.stdout.write(move_cursor_up(extra_lines))
-                
+               
                 # Overwrite the old content with blank lines
                 sys.stdout.write(("\r" + " " * width + "\n") * extra_lines)
-                
+               
                 # Move cursor back up to the start of the footer
                 sys.stdout.write(move_cursor_up(extra_lines))
+
+            lines_printed_last_cycle = current_line_count - 1
             
             sys.stdout.flush()
             
@@ -520,7 +565,7 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
         # Clear the display area cleanly when finished or interrupted
         if lines_printed_last_cycle > 0:
             sys.stdout.write(move_cursor_up(lines_printed_last_cycle))
-            sys.stdout.write(" " * width + "\n" * (lines_printed_last_cycle - 1))
+            sys.stdout.write(" " * width + "\n" * (lines_printed_last_cycle + 1))
             sys.stdout.write(move_cursor_up(lines_printed_last_cycle))
             sys.stdout.flush()
 
@@ -552,12 +597,11 @@ def main():
 
     # Combine Mount Point + Relative Path
     src_root = safe_join(src_mp, src_cfg.get('path', ''))
-    
-    files_to_copy, total_src_bytes = [], 0
 
     # Mount Destinations & Check Space
     dest_cfgs = config['destinations']
-    jobs = []
+    jobs_by_file = {} 
+    total_job_bytes = 0
     
     # Calculate global total bytes to transfer (Source Size * Num Valid Destinations)
     # We build the job list to know exactly what runs.
@@ -565,42 +609,57 @@ def main():
     for d_cfg in dest_cfgs:
         d_mp = mount_drive(d_cfg['uuid'], d_cfg['mount_point'])
         if not d_mp:
-            print(f"Skipping destination {d_cfg['uuid']}")
+            print(f"Skipping destination {d_cfg['mount_point']}")
             continue
             
         # Define specific destination root
         dest_root = safe_join(d_mp, d_cfg.get('path', ''))
 
         # Determine files to be copied
-        files_to_copy, total_src_bytes = scan_source(src_root, dest_root, src_cfg.get('exclude_patterns', []))
-        if not files_to_copy:
-            print("No files found to copy.")
+        files_to_copy_data, total_net_change_bytes = scan_source(src_root, dest_root, d_cfg.get('deletion_exclude_patterns', []))
+
+        if not files_to_copy_data:
+            print(f"Destination {d_cfg['mount_point']} is up to date.")
             continue
         
         # Check space on this specific root's partition
-        ensure_space(dest_root, total_src_bytes, d_cfg.get('deletion_policy', 'oldest'))
-        
-        # Generate Jobs
-        for src_abs, rel_path, f_size in files_to_copy:
+        ensure_space(dest_root, total_net_change_bytes, d_cfg.get('deletion_policy', 'oldest'))
+    
+        # Generate Jobs (Note: we use new_size as the job size)
+        for src_abs, rel_path, new_size, existing_size in files_to_copy_data:
             dst_abs = os.path.join(dest_root, rel_path)
             
             # Create directories
             os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
             
-            jobs.append(Job(src_abs, dst_abs, f_size, d_cfg.get('priority', 99)))
+            # We pass new_size to the Job
+            jobs_by_file.setdefault(rel_path, []).append(Job(src_abs, dst_abs, new_size, d_cfg.get('priority', 99), dest_uuid=d_cfg['uuid']))
+            total_job_bytes += new_size # Keep accumulating the final *destination* size for global stats
 
-    if not jobs:
+    if not jobs_by_file:
         print("No jobs created.")
         unmount_all(not args.umount)
         return
+    
+    final_jobs_list = []
+    sorted_file_keys = sorted(jobs_by_file.keys())
 
-    total_job_bytes = sum(j.size for j in jobs)
+    # Iterate over files (File 1, File 2, File 3...)
+    for rel_path in sorted_file_keys:
+        # Iterate over the destinations for that file (Dest A, Dest B, Dest C...)
+        # This guarantees the first N jobs started are all for the first source file 
+        # but target different destinations.
+        
+        # We sort the jobs here by priority to respect that first for a given file
+        jobs_for_file = sorted(jobs_by_file[rel_path], key=lambda j: j.priority)
+        
+        final_jobs_list.extend(jobs_for_file)
 
     # Run Copy
     print(f"Starting Copy. Total data: {format_bytes(total_job_bytes)}")
     time.sleep(1)
     
-    display_loop(jobs, config.get('max_parallel_processes', 1), total_job_bytes)
+    display_loop(final_jobs_list, config.get('max_parallel_processes', 2), total_job_bytes)
     
     end_time = time.time()
     end_time_str = format_time_detailed(end_time - start_time)
