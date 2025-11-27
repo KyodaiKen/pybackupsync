@@ -187,6 +187,39 @@ def unmount_all(prompt=False):
             
     AUTO_MOUNTED_PATHS.clear()
 
+def optimize_drive_if_ssd(mount_point):
+    """
+    Checks if the drive mounted at mount_point is an SSD (non-rotational).
+    If so, runs fstrim to optimize free space.
+    """
+    try:
+        # 1. Find the source device for the mount point
+        # findmnt -n -o SOURCE --target /path/to/mount
+        result = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "--target", mount_point],
+            capture_output=True, text=True, check=True
+        )
+        device_node = result.stdout.strip()
+        
+        # 2. Check rotational status
+        # lsblk -dno ROTATIONAL /dev/sdX
+        # Returns 1 for HDD (rotational), 0 for SSD
+        res_rot = subprocess.run(
+            ["lsblk", "-dno", "ROTATIONAL", device_node],
+            capture_output=True, text=True, check=True
+        )
+        is_ssd = (res_rot.stdout.strip() == "0")
+        
+        if is_ssd:
+            print(f"SSD detected at {mount_point}. Running fstrim...")
+            subprocess.run(["fstrim", "-v", mount_point], check=True)
+        else:
+            # print(f"HDD detected at {mount_point}. Skipping fstrim.")
+            pass
+            
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"Warning: Could not check/optimize SSD for {mount_point}: {e}")
+
 # --- File Operations & Space Management ---
 
 def scan_source(root_path, dest_root, exclude_patterns):
@@ -231,38 +264,55 @@ def scan_source(root_path, dest_root, exclude_patterns):
                 
     return files_found, total_bytes_needed
 
-def get_files_with_ctime(directory):
-    """Return list of (path, ctime) for all files in directory recursively."""
+def get_files_in_specific_directories(directory_list):
+    """
+    Return list of (path, ctime) for all files ONLY in the provided directories.
+    This does NOT scan recursively. It only looks at the specific folders
+    where new files are being copied to.
+    """
     res = []
-    for root, _, files in os.walk(directory):
-        for f in files:
-            p = os.path.join(root, f)
-            try:
-                res.append((p, os.path.getctime(p)))
-            except OSError:
-                pass
+    
+    # Use a set to avoid scanning the same directory twice if multiple files go there
+    unique_dirs = set(directory_list)
+    
+    for d in unique_dirs:
+        if not os.path.exists(d):
+            continue
+            
+        try:
+            # We use scandir for better performance on flat directory scans
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        try:
+                            # Get status directly from entry
+                            stat = entry.stat()
+                            res.append((entry.path, stat.st_ctime))
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+            
     return res
 
-def ensure_space(target_root, needed_bytes, policy):
+def ensure_space(mount_point, target_dirs, needed_bytes, policy):
     """
-    Deletes files in target_root based on policy until needed_bytes fits.
-    target_root: The specific destination folder (Mount + Dest Relative).
+    Deletes files in target_dirs based on policy until needed_bytes fits.
+    mount_point: Used to check the actual disk partition usage.
+    target_dirs: A list of specific directories where we are allowed to delete old files.
     """
-    if not os.path.exists(target_root):
-        # If the folder doesn't exist, we assume the partition has space, 
-        # or we check the partition of the parent.
-        os.makedirs(target_root, exist_ok=True)
-
-    # Check partition usage
-    total, used, free = shutil.disk_usage(target_root)
+    # Check partition usage on the mount point
+    total, used, free = shutil.disk_usage(mount_point)
     
     if needed_bytes <= 0 or free >= needed_bytes:
         return
 
     deficit = needed_bytes - free
-    print(f"Cleaning up {target_root} (Policy: {policy}). Need {format_bytes(deficit)} more.")
+    print(f"Cleaning up (Policy: {policy}). Need {format_bytes(deficit)} more.")
 
-    files = get_files_with_ctime(target_root)
+    # 🚨 CHANGE: Only get files from the directories we are touching
+    files = get_files_in_specific_directories(target_dirs)
+    
     to_delete = []
 
     if policy == "oldest":
@@ -296,7 +346,7 @@ def ensure_space(target_root, needed_bytes, policy):
         try:
             sz = os.path.getsize(fpath)
             os.remove(fpath)
-            print(f"Delted {fpath}")
+            print(f"Deleted {fpath}")
             deleted_size += sz
             free += sz
             if free >= needed_bytes:
@@ -304,6 +354,10 @@ def ensure_space(target_root, needed_bytes, policy):
                 return
         except OSError:
             pass
+
+    if len(to_delete) > 0:
+        # Optimize SSD after deletion
+        optimize_drive_if_ssd(mount_point)
 
     print(f"Warning: Cleanup finished but might still lack space.")
 
@@ -328,12 +382,6 @@ class Job:
         
         # Resume detection
         self.resume_mode = False
-        """ NOT IMPLEMENTED
-            if os.path.exists(dst):
-            dst_sz = os.path.getsize(dst)
-            if dst_sz < size:
-                self.resume_mode = True
-                self.bytes_done = dst_sz """
 
     def __lt__(self, other):
         # 1. Primary sort: Lower priority value comes first (higher priority)
@@ -341,8 +389,6 @@ class Job:
             return self.priority < other.priority
         
         # 2. Secondary sort (Interleaving): Use the UUID string for alternating
-        #    This ensures Dest A jobs come before Dest B jobs, creating a stable,
-        #    alternating order when priorities are equal.
         if self.dest_uuid != other.dest_uuid:
             return self.dest_uuid < other.dest_uuid
             
@@ -352,18 +398,10 @@ class Job:
 def worker_func(job, queue):
     """
     Executes PV.
-    Command: pv -i 0.5 -F "%t %b %r %a" -n {$source} > {$destination}
-    "-L 1048576" is for testing the progress bar to slow it down to 1048576 byte per second. (WOW)
-    Add -s if resuming.
+    Command: pv -i 0 -F "%t %b %r %a" -n {$source} -o {$destination}
     """
     cmd = ["pv", "-i", "0", "-F", "%t %b %r %a", "-n", job.src, "-o", job.dst]
     
-    #if job.resume_mode:
-        # NOT IMPLEMENTED YET
-
-    # For testing
-    # cmd.insert(1, "-L " + str(1048576/2))
-
     try:
         # PV with -n writes numeric data to Stderr
         proc = subprocess.Popen(
@@ -380,9 +418,6 @@ def worker_func(job, queue):
                 break
             
             parts = line.strip().split()
-            # Expecting 4 parts based on format "%t %b %r %a"
-            # %t: elapsed, %b: bytes, %r: rate, %a: avg rate
-            # Note: format string logic in PV usually produces space separated values.
             if len(parts) >= 4:
                 try:
                     # Update Job
@@ -406,7 +441,6 @@ def worker_func(job, queue):
             queue.put(('done', job))
         else:
             job.error = f"Exit Code {proc.returncode}"
-            #print(f"Error code: {proc.returncode}, command: {cmd}");
             queue.put(('error', job))
 
     except Exception as e:
@@ -476,7 +510,6 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
 
             # Rendering
             width = get_terminal_width()
-            #print("\033[H\033[J", end="") # ANSI Clear Screen
 
             sys.stdout.write(move_cursor_up(lines_printed_last_cycle))
             sys.stdout.flush()
@@ -493,7 +526,6 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
                 pct = 0.0
                 if j.size > 0: pct = (j.bytes_done / j.size) * 100.0
                 
-                # Format: {$PercentDone} {$BytesTransferred} / {$file_size} @{TransferRate} ({$TransferRateAvg}) ETA: {$TimeRemaining}
                 stats = f"{format_bytes(j.bytes_done)}/{format_bytes(j.size)}={pct:6.2f}% @{format_rate(j.rate)} a{format_rate(j.avg_rate)} ETA: {format_time(j.eta)} "
                 
                 bar_space = width - len(stats) - 12
@@ -512,22 +544,16 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
                 first = False
 
             # --- Total Progress ---
-            # Sum bytes done from (completed + active)
-            # Pending bytes are 0 done.
-            
             # Recalculate accurate total bytes done
             total_done = sum(j.size for j in completed_jobs) + sum(j.bytes_done for j in active)
             
-            # Total Rate: Sum of active current rates
             total_rate = sum(j.rate for j in active)
-            # Total Avg Rate: Sum of active average rates (approximation requested)
             total_avg_rate = sum(j.avg_rate for j in active)
             
             total_pct = 0.0
             if total_scope_bytes > 0:
                 total_pct = (total_done / total_scope_bytes) * 100.0
                 
-            # Total ETA
             total_eta = 0
             remaining_total = total_scope_bytes - total_done
             if total_avg_rate > 0:
@@ -547,30 +573,20 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             current_line_count = len(output_lines)
             if lines_printed_last_cycle > current_line_count:
                 extra_lines = lines_printed_last_cycle - current_line_count
-               
-                # Move cursor up to the start of the extra space
-                sys.stdout.write(move_cursor_up(extra_lines))
-               
-                # Overwrite the old content with blank lines
-                sys.stdout.write(("\r" + " " * width + "\n") * extra_lines)
-               
-                # Move cursor back up to the start of the footer
-                sys.stdout.write(move_cursor_up(extra_lines))
+                sys.stdout.write(move_cursor_up(extra_lines+2))
+                sys.stdout.write(("\r" + " " * width + "\n") * extra_lines+1)
+                sys.stdout.write(move_cursor_up(extra_lines+2))
 
             lines_printed_last_cycle = current_line_count - 1
-            
             sys.stdout.flush()
-            
             time.sleep(0.1)
 
     except KeyboardInterrupt:
         SHUTDOWN_EVENT.set()
 
     finally:
-        # Clear the display area cleanly when finished or interrupted
         sys.stdout.write("\n")
         sys.stdout.flush()
-        
         if lines_printed_last_cycle > 0:
             lines_printed_last_cycle += 1
             sys.stdout.write(move_cursor_up(lines_printed_last_cycle+1))
@@ -582,7 +598,6 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
 
 def main():
     start_time = time.time()
-
     signal.signal(signal.SIGINT, lambda s, f: SHUTDOWN_EVENT.set())
     
     parser = argparse.ArgumentParser()
@@ -612,18 +627,13 @@ def main():
     jobs_by_file = {} 
     total_job_bytes = 0
     
-    # Calculate global total bytes to transfer (Source Size * Num Valid Destinations)
-    # We build the job list to know exactly what runs.
-    
     for d_cfg in dest_cfgs:
         d_mp = mount_drive(d_cfg['uuid'], d_cfg['mount_point'])
         if not d_mp:
             print(f"Skipping destination {d_cfg['mount_point']}")
             continue
             
-        # Define specific destination root
         dest_root = safe_join(d_mp, d_cfg.get('path', ''))
-
         deletion_patterns = d_cfg.get('deletion_exclude_patterns', [])
         deletion_disabled = (deletion_patterns == ['*'])
 
@@ -634,22 +644,26 @@ def main():
             print(f"Destination {d_cfg['mount_point']} is up to date.")
             continue
         
-        # Check space on this specific root's partition
+        # Gather list of specific destination directories involved
+        affected_directories = set()
+        for _, rel_path, _, _ in files_to_copy_data:
+            # We want the folder containing the file in the destination
+            full_dest_path = os.path.join(dest_root, rel_path)
+            affected_directories.add(os.path.dirname(full_dest_path))
+
+        # Check space
         if deletion_disabled:
             print(f"Cleanup skipped for {d_cfg['mount_point']} (Deletion disabled by '*' pattern).")
         else:
-            ensure_space(dest_root, total_net_change_bytes, d_cfg.get('deletion_policy', 'oldest'))
-    
-        # Generate Jobs (Note: we use new_size as the job size)
+            # Pass mount_point (for total partition check) AND specific directories (for deletion candidates)
+            ensure_space(d_mp, list(affected_directories), total_net_change_bytes, d_cfg.get('deletion_policy', 'oldest'))
+
+        # Generate Jobs
         for src_abs, rel_path, new_size, existing_size in files_to_copy_data:
             dst_abs = os.path.join(dest_root, rel_path)
-            
-            # Create directories
             os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
-            
-            # We pass new_size to the Job
             jobs_by_file.setdefault(rel_path, []).append(Job(src_abs, dst_abs, new_size, d_cfg.get('priority', 99), dest_uuid=d_cfg['uuid']))
-            total_job_bytes += new_size # Keep accumulating the final *destination* size for global stats
+            total_job_bytes += new_size
 
     if not jobs_by_file:
         print("No jobs created.")
@@ -659,18 +673,10 @@ def main():
     final_jobs_list = []
     sorted_file_keys = sorted(jobs_by_file.keys())
 
-    # Iterate over files (File 1, File 2, File 3...)
     for rel_path in sorted_file_keys:
-        # Iterate over the destinations for that file (Dest A, Dest B, Dest C...)
-        # This guarantees the first N jobs started are all for the first source file 
-        # but target different destinations.
-        
-        # We sort the jobs here by priority to respect that first for a given file
         jobs_for_file = sorted(jobs_by_file[rel_path], key=lambda j: j.priority)
-        
         final_jobs_list.extend(jobs_for_file)
 
-    # Run Copy
     print(f"Starting Copy. Total data: {format_bytes(total_job_bytes)}")
     time.sleep(1)
     
@@ -681,7 +687,6 @@ def main():
 
     print(f"\nCopy operation finished after {end_time_str}.")
     
-    # Cleanup
     if args.umount:
         unmount_all()
     elif AUTO_MOUNTED_PATHS:
