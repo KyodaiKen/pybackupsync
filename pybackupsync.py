@@ -99,14 +99,14 @@ def shorten_path(path_str, max_len):
     return path_str[:half] + "..." + path_str[-half:]
 
 def draw_progress_bar(percent, width):
-    if width < 5: return "[]"
-    bar_width = width - 2
+    if width < 5: return ""
+    bar_width = width
     filled = int(bar_width * (percent / 100.0))
-    bar_str = "=" * filled
-    if filled < bar_width:
-        bar_str += ">"
-    padding = " " * (bar_width - len(bar_str))
-    return f"[{bar_str}{padding}]"
+    bar_str = "█" * filled
+    #if filled < bar_width:
+    #    bar_str += "▒"
+    padding = "░" * (bar_width - len(bar_str))
+    return f"{bar_str}{padding}"
 
 # --- Drive & Path Management ---
 
@@ -362,7 +362,7 @@ def worker_func(job, queue):
         # NOT IMPLEMENTED YET
 
     # For testing
-    # cmd.insert(1, "-L 1048576")
+    # cmd.insert(1, "-L " + str(1048576/2))
 
     try:
         # PV with -n writes numeric data to Stderr
@@ -482,9 +482,10 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             sys.stdout.flush()
 
             output_lines = []
-            output_lines.append("+" + ("=" * (width - 2)) + "+")
+            output_lines.append("┏" + ("━" * (width - 2)) + "┓")
 
             # --- Individual Jobs ---
+            first = True
             for j in active:
                 s_name = shorten_path(j.src, width - 12)
                 d_name = shorten_path(j.dst, width - 12)
@@ -502,10 +503,13 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
                 s_pad = " " * (width - len(s_name) - 12)
                 d_pad = " " * (width - len(d_name) - 12)
 
-                output_lines.append(f"| Source: {s_name}{s_pad} |")
-                output_lines.append(f"| Destin: {d_name}{d_pad} |")
-                output_lines.append(f"| Prgrss: {stats}{bar} |")
-                output_lines.append("+" + ("-" * (width - 2)) + "+")
+                if first == False:
+                    output_lines.append("┠" + ("─" * (width - 2)) + "┨")
+                output_lines.append(f"┃ Source: {s_name}{s_pad} ┃")
+                output_lines.append(f"┃ Destin: {d_name}{d_pad} ┃")
+                output_lines.append(f"┃ Prgrss: {stats}{bar} ┃")
+                
+                first = False
 
             # --- Total Progress ---
             # Sum bytes done from (completed + active)
@@ -532,8 +536,9 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             t_stats = f"{format_bytes(total_done)}/{format_bytes(total_scope_bytes)}={total_pct:6.2f}% @{format_rate(total_rate)} a{format_rate(total_avg_rate)} ETA: {format_time(total_eta)} "
             t_bar = draw_progress_bar(total_pct, width - len(t_stats) - 12)
             
-            output_lines.append(f"| TOTAL : {t_stats}{t_bar} |")
-            output_lines.append("+" + ("=" * (width - 2)) + "+")
+            output_lines.append("┣" + ("━" * (width - 2)) + "┫")
+            output_lines.append(f"┃ TOTAL : {t_stats}{t_bar} ┃")
+            output_lines.append("┗" + ("━" * (width - 2)) + "┛")
 
             # Print the new content
             sys.stdout.write("\n".join(output_lines))
@@ -556,17 +561,21 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             
             sys.stdout.flush()
             
-            time.sleep(0.5)
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
         SHUTDOWN_EVENT.set()
 
     finally:
         # Clear the display area cleanly when finished or interrupted
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        
         if lines_printed_last_cycle > 0:
-            sys.stdout.write(move_cursor_up(lines_printed_last_cycle))
-            sys.stdout.write(" " * width + "\n" * (lines_printed_last_cycle + 1))
-            sys.stdout.write(move_cursor_up(lines_printed_last_cycle))
+            lines_printed_last_cycle += 1
+            sys.stdout.write(move_cursor_up(lines_printed_last_cycle+1))
+            sys.stdout.write(" " * width + "\n" * (lines_printed_last_cycle))
+            sys.stdout.write(move_cursor_up(lines_printed_last_cycle+1))
             sys.stdout.flush()
 
 # --- Main Logic ---
@@ -615,15 +624,21 @@ def main():
         # Define specific destination root
         dest_root = safe_join(d_mp, d_cfg.get('path', ''))
 
+        deletion_patterns = d_cfg.get('deletion_exclude_patterns', [])
+        deletion_disabled = (deletion_patterns == ['*'])
+
         # Determine files to be copied
-        files_to_copy_data, total_net_change_bytes = scan_source(src_root, dest_root, d_cfg.get('deletion_exclude_patterns', []))
+        files_to_copy_data, total_net_change_bytes = scan_source(src_root, dest_root, src_cfg.get('exclude_patterns', []))
 
         if not files_to_copy_data:
             print(f"Destination {d_cfg['mount_point']} is up to date.")
             continue
         
         # Check space on this specific root's partition
-        ensure_space(dest_root, total_net_change_bytes, d_cfg.get('deletion_policy', 'oldest'))
+        if deletion_disabled:
+            print(f"Cleanup skipped for {d_cfg['mount_point']} (Deletion disabled by '*' pattern).")
+        else:
+            ensure_space(dest_root, total_net_change_bytes, d_cfg.get('deletion_policy', 'oldest'))
     
         # Generate Jobs (Note: we use new_size as the job size)
         for src_abs, rel_path, new_size, existing_size in files_to_copy_data:
