@@ -44,7 +44,7 @@ def format_bytes(size):
     while n >= power and count < 4:
         n /= power
         count += 1
-    return f"{n:07.2f} {power_labels[count]}"
+    return f"{n:7.2f}{power_labels[count]}"
 
 def format_rate(rate_bytes_per_sec):
     return f"{format_bytes(rate_bytes_per_sec)}/s"
@@ -60,8 +60,8 @@ def format_time(seconds):
     d, h = divmod(h, 24)
     
     if d > 0:
-        return f"{d:02d}:{h:02d}:{m:02d}"
-    return f"00:{h:02d}:{m:02d}"
+        return f"{d:2d}d{h:2d}h{m:2d}m"
+    return f" 0d{h:2d}h{m:2d}m"
 
 def format_time_detailed(total_seconds_float):
     """
@@ -493,7 +493,7 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
                 if j.size > 0: pct = (j.bytes_done / j.size) * 100.0
                 
                 # Format: {$PercentDone} {$BytesTransferred} / {$file_size} @{TransferRate} ({$TransferRateAvg}) ETA: {$TimeRemaining}
-                stats = f"{pct:06.2f}% {format_bytes(j.bytes_done)} / {format_bytes(j.size)} @{format_rate(j.rate)} ({format_rate(j.avg_rate)}) ETA: {format_time(j.eta)} "
+                stats = f"{format_bytes(j.bytes_done)}/{format_bytes(j.size)}={pct:6.2f}% @{format_rate(j.rate)} a{format_rate(j.avg_rate)} ETA: {format_time(j.eta)} "
                 
                 bar_space = width - len(stats) - 12
                 bar = draw_progress_bar(pct, bar_space)
@@ -529,7 +529,7 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             if total_avg_rate > 0:
                 total_eta = remaining_total / total_avg_rate
 
-            t_stats = f"{total_pct:06.2f}% {format_bytes(total_done)} / {format_bytes(total_scope_bytes)} @{format_rate(total_rate)} ({format_rate(total_avg_rate)}) ETA: {format_time(total_eta)} "
+            t_stats = f"{format_bytes(total_done)}/{format_bytes(total_scope_bytes)}={total_pct:6.2f}% @{format_rate(total_rate)} a{format_rate(total_avg_rate)} ETA: {format_time(total_eta)} "
             t_bar = draw_progress_bar(total_pct, width - len(t_stats) - 12)
             
             output_lines.append(f"| TOTAL : {t_stats}{t_bar} |")
