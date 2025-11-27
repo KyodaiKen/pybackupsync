@@ -51,7 +51,7 @@ def format_rate(rate_bytes_per_sec):
 
 def format_time(seconds):
     if seconds is None:
-        return "--:--:--"
+        return "(unknown)"
     if seconds > 86400 * 99: # > 99 days
         return "\033[91mETERNITY\033[0m" # Red Text
     
@@ -95,8 +95,8 @@ def format_time_detailed(total_seconds_float):
 def shorten_path(path_str, max_len):
     if len(path_str) <= max_len:
         return path_str
-    half = (max_len - 3) // 2
-    return path_str[:half] + "..." + path_str[-half:]
+    half = (max_len - 1) // 2
+    return path_str[:half] + "…" + path_str[-half:]
 
 def draw_progress_bar(percent, width):
     if width < 5: return ""
@@ -571,12 +571,14 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             
             # Clear extra lines if the number of active jobs decreased
             current_line_count = len(output_lines)
-            if lines_printed_last_cycle > current_line_count:
-                extra_lines = lines_printed_last_cycle - current_line_count
-                sys.stdout.write(move_cursor_up(extra_lines+2))
-                sys.stdout.write(("\r" + " " * width + "\n") * extra_lines+1)
-                sys.stdout.write(move_cursor_up(extra_lines+2))
+            lines_to_clear = lines_printed_last_cycle - current_line_count
+            
+            if lines_to_clear > 0:
+                sys.stdout.write(move_cursor_up(lines_to_clear))
+                sys.stdout.write(("\r" + (" " * width) + "\n") * lines_to_clear)
+                sys.stdout.write(move_cursor_up(lines_to_clear))
 
+            # Update the count for the next iteration. This must be the actual height of the current frame minus 1 (because the top line of the frame is the start of the frame).
             lines_printed_last_cycle = current_line_count - 1
             sys.stdout.flush()
             time.sleep(0.1)
@@ -585,14 +587,11 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
         SHUTDOWN_EVENT.set()
 
     finally:
-        sys.stdout.write("\n")
+        total_lines_to_move_up = lines_printed_last_cycle + 1
+        sys.stdout.write(move_cursor_up(total_lines_to_move_up))
+        sys.stdout.write(("\r" + " " * width + "\n") * total_lines_to_move_up)
+        sys.stdout.write(move_cursor_up(total_lines_to_move_up))
         sys.stdout.flush()
-        if lines_printed_last_cycle > 0:
-            lines_printed_last_cycle += 1
-            sys.stdout.write(move_cursor_up(lines_printed_last_cycle+1))
-            sys.stdout.write(" " * width + "\n" * (lines_printed_last_cycle))
-            sys.stdout.write(move_cursor_up(lines_printed_last_cycle+1))
-            sys.stdout.flush()
 
 # --- Main Logic ---
 
