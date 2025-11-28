@@ -62,14 +62,11 @@ sudo touch -d "2023-01-01" $MNT_TMP/backups/primary/old_file_1.dat
 sudo dd if=/dev/zero of=$MNT_TMP/backups/primary/old_file_2.dat bs=1M count=10 status=none
 sudo touch -d "2023-01-11" $MNT_TMP/backups/primary/old_file_2.dat
 
-sudo dd if=/dev/zero of=$MNT_TMP/backups/primary/old_file_2.dat bs=1M count=10 status=none
-sudo touch -d "2023-02-01" $MNT_TMP/backups/primary/old_file_2.dat
-
-sudo dd if=/dev/zero of=$MNT_TMP/backups/primary/old_file_3.dat bs=1M count=5 status=none
-sudo touch -d "2023-02-22" $MNT_TMP/backups/primary/old_file_3.dat
+sudo dd if=/dev/zero of=$MNT_TMP/backups/primary/old_file_3.dat bs=1M count=10 status=none
+sudo touch -d "2023-02-01" $MNT_TMP/backups/primary/old_file_3.dat
 
 sudo dd if=/dev/zero of=$MNT_TMP/backups/primary/old_file_4.dat bs=1M count=5 status=none
-sudo touch -d "2023-02-28" $MNT_TMP/backups/primary/old_file_4.dat
+sudo touch -d "2023-02-22" $MNT_TMP/backups/primary/old_file_4.dat
 
 echo "   -> Dest1 State: 40MB Used, ~15MB Free. Contains files from Jan, Feb, Mar, Apr."
 sudo umount $MNT_TMP

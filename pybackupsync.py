@@ -18,6 +18,7 @@ import itertools
 SHUTDOWN_EVENT = threading.Event()
 AUTO_MOUNTED_PATHS = [] # Tracks mount points we created
 TERMINAL_WIDTH = 80
+SLOW = False
 job_counter = itertools.count()
 
 # --- Formatting Utilities ---
@@ -396,11 +397,14 @@ class Job:
         return self.count < other.count
 
 def worker_func(job, queue):
+    global SLOW
     """
     Executes PV.
     Command: pv -i 0 -F "%t %b %r %a" -n {$source} -o {$destination}
     """
     cmd = ["pv", "-i", "0", "-F", "%t %b %r %a", "-n", job.src, "-o", job.dst]
+    if SLOW:
+        cmd.insert(3, f"-L {(1024*1024)}")
     
     try:
         # PV with -n writes numeric data to Stderr
@@ -570,16 +574,16 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
             sys.stdout.write("\n".join(output_lines))
             
             # Clear extra lines if the number of active jobs decreased
-            current_line_count = len(output_lines)
+            current_line_count = len(output_lines) - 1
             lines_to_clear = lines_printed_last_cycle - current_line_count
             
             if lines_to_clear > 0:
-                sys.stdout.write(move_cursor_up(lines_to_clear))
+                lines_to_clear += 1
                 sys.stdout.write(("\r" + (" " * width) + "\n") * lines_to_clear)
                 sys.stdout.write(move_cursor_up(lines_to_clear))
 
             # Update the count for the next iteration. This must be the actual height of the current frame minus 1 (because the top line of the frame is the start of the frame).
-            lines_printed_last_cycle = current_line_count - 1
+            lines_printed_last_cycle = current_line_count
             sys.stdout.flush()
             time.sleep(0.1)
 
@@ -587,22 +591,43 @@ def display_loop(jobs, max_parallel, total_scope_bytes):
         SHUTDOWN_EVENT.set()
 
     finally:
-        total_lines_to_move_up = lines_printed_last_cycle + 1
-        sys.stdout.write(move_cursor_up(total_lines_to_move_up))
-        sys.stdout.write(("\r" + " " * width + "\n") * total_lines_to_move_up)
-        sys.stdout.write(move_cursor_up(total_lines_to_move_up))
+        # Move past the final progress bar
+        sys.stdout.write("\n")
         sys.stdout.flush()
+        
+        # Clear the whole block one last time to leave a clean terminal
+        if lines_printed_last_cycle > 0:
+            # Calculate total height of the last frame drawn
+            total_height = lines_printed_last_cycle + 1
+            
+            # 1. Move up to the start of the block
+            sys.stdout.write(move_cursor_up(total_height))
+            
+            # 2. Overwrite everything with whitespace
+            sys.stdout.write(("\r" + (" " * width) + "\n") * total_height)
+            
+            # 3. Move back up to leave the cursor where the block started
+            #    (so the prompt returns at the correct place)
+            sys.stdout.write(move_cursor_up(total_height))
+            sys.stdout.flush()
 
 # --- Main Logic ---
 
 def main():
+    global SLOW
     start_time = time.time()
     signal.signal(signal.SIGINT, lambda s, f: SHUTDOWN_EVENT.set())
     
     parser = argparse.ArgumentParser()
     parser.add_argument("-um", "--umount", action="store_true", help="Unmount after success")
     parser.add_argument("-C", "--config", help="Config file path")
+    parser.add_argument("-s", "--slow", action="store_true", help="Limit the copy speed to 0.5 MB/s for testing")
     args = parser.parse_args()
+
+    SLOW = args.slow
+
+    if SLOW:
+        print("WARNING: SLOW MODE ENABLED -> 1MByte/s speed limit enabled!")
 
     # Load Config
     cfg_path = args.config if args.config else os.path.expanduser("~/.pybackupsync.yaml")
