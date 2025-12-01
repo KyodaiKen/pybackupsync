@@ -311,56 +311,102 @@ def ensure_space(mount_point, target_dirs, needed_bytes, policy):
     deficit = needed_bytes - free
     print(f"Cleaning up (Policy: {policy}). Need {format_bytes(deficit)} more.")
 
-    # 🚨 CHANGE: Only get files from the directories we are touching
+    # Get all candidate files in the specified directories
     files = get_files_in_specific_directories(target_dirs)
     
+    # List to hold paths selected for deletion
     to_delete = []
 
     if policy == "oldest":
-        # Sort by ctime asc
+        # Sort by ctime asc (oldest first)
         files.sort(key=lambda x: x[1])
         to_delete = [x[0] for x in files]
-
+        
     elif policy == "month_dupes":
-        # Group by YYYY-MM
+        
+        # --- Stage 1: Identify and prioritize monthly duplicates for deletion ---
         groups = {}
         for p, t in files:
+            # Group by YYYY-MM
             m = datetime.fromtimestamp(t).strftime('%Y-%m')
             if m not in groups: groups[m] = []
             groups[m].append((p, t))
         
-        candidates = []
+        duplicates_to_delete = []
+        remaining_files = [] # Files that survived the duplicate removal (max 1 per month)
+        
         for m in groups:
-            # Sort files within month
+            # Sort files within month (oldest to newest)
             month_files = sorted(groups[m], key=lambda x: x[1])
+            
             # Keep the last one (newest), mark others for deletion
             if len(month_files) > 1:
-                candidates.extend(month_files[:-1])
+                duplicates_to_delete.extend(month_files[:-1])
+                remaining_files.append(month_files[-1]) # The keeper
+            else:
+                remaining_files.append(month_files[0]) # The single archive
         
-        # Sort candidates by age to delete oldest duplicates first
-        candidates.sort(key=lambda x: x[1])
-        to_delete = [x[0] for x in candidates]
+        # Prioritize deletion of monthly duplicates (oldest first)
+        duplicates_to_delete.sort(key=lambda x: x[1])
+        
+        # We will now delete these files sequentially until space is freed or we run out.
+        to_delete = [x[0] for x in duplicates_to_delete]
 
-    # Execute deletion
+    # --- EXECUTE DELETION LOOP ---
     deleted_size = 0
-    for fpath in to_delete:
+    
+    # 1. Execute deletions based on the initial 'to_delete' list (used by both policies)
+    paths_to_remove_from_candidates = [] # Tracks files deleted in Stage 1 for 'month_dupes'
+
+    for i, fpath in enumerate(to_delete):
+        if free >= needed_bytes:
+            break
         try:
             sz = os.path.getsize(fpath)
             os.remove(fpath)
-            print(f"Deleted {fpath}")
+            print(f"Deleted (Policy: {policy.upper()}): {fpath}")
             deleted_size += sz
             free += sz
-            if free >= needed_bytes:
-                print(f"Freed enough space ({format_bytes(deleted_size)}).")
-                return
+            if policy == "month_dupes":
+                paths_to_remove_from_candidates.append(fpath)
         except OSError:
             pass
+            
+    # 2. MONTH_DUPES ONLY: If space is still needed, delete oldest monthly archives
+    if policy == "month_dupes" and free < needed_bytes:
+        print(f"Monthly duplicates cleaned. Still need {format_bytes(needed_bytes - free)} more. Starting monthly archive deletion.")
+        
+        # Filter 'remaining_files' to ensure we only have files that WEREN'T duplicates
+        # and then delete the oldest of those until space is freed.
+        
+        # Sort the remaining single monthly files by age (oldest first)
+        remaining_files.sort(key=lambda x: x[1]) 
+        
+        # Continue deletion using the oldest remaining archive files
+        for path, _ in remaining_files:
+            # Ensure this file wasn't already in the duplicates list (edge case safety)
+            if path in paths_to_remove_from_candidates:
+                continue
+                
+            if free >= needed_bytes:
+                break
+            try:
+                sz = os.path.getsize(path)
+                os.remove(path)
+                print(f"Deleted (Archive): {path}")
+                deleted_size += sz
+                free += sz
+            except OSError:
+                pass
 
-    if len(to_delete) > 0:
+    if deleted_size > 0:
         # Optimize SSD after deletion
         optimize_drive_if_ssd(mount_point)
 
-    print(f"Warning: Cleanup finished but might still lack space.")
+    if free >= needed_bytes:
+        print(f"Freed enough space ({format_bytes(deleted_size)}).")
+    else:
+        print(f"Warning: Cleanup finished but might still lack space.")
 
 # --- Copy Logic & Workers ---
 
